@@ -16,21 +16,20 @@
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
+import asyncio
+import io
 import logging
 import math
 import os
 import re
 import shutil
 import tempfile
-import threading
-import time
 from configparser import ConfigParser
 from hashlib import sha256, md5
-from importlib import import_module, reload
-from pathlib import Path
+from importlib import import_module
+from pathlib import Path, PurePath
 from signal import signal, SIGINT, SIGTERM, SIGABRT
-from threading import Thread
-from typing import Union, List
+from typing import Union, List, BinaryIO
 
 from pyrogram.api import functions, types
 from pyrogram.api.core import TLObject
@@ -40,10 +39,12 @@ from pyrogram.client.methods.password.utils import compute_check
 from pyrogram.crypto import AES
 from pyrogram.errors import (
     PhoneMigrate, NetworkMigrate, SessionPasswordNeeded,
-    FloodWait, PeerIdInvalid, VolumeLocNotFound, UserMigrate, ChannelPrivate, AuthBytesInvalid,
-    BadRequest)
+    PeerIdInvalid, VolumeLocNotFound, UserMigrate, ChannelPrivate,
+    AuthBytesInvalid, BadRequest
+)
 from pyrogram.session import Auth, Session
 from .ext import utils, Syncer, BaseClient, Dispatcher
+from .ext.utils import ainput
 from .methods import Methods
 from .storage import Storage, FileStorage, MemoryStorage
 from .types import User, SentCode, TermsOfService
@@ -126,7 +127,7 @@ class Client(Methods, BaseClient):
             Defaults to False.
 
         workers (``int``, *optional*):
-            Thread pool size for handling incoming updates.
+            Number of maximum concurrent workers for handling incoming updates.
             Defaults to 4.
 
         workdir (``str``, *optional*):
@@ -141,6 +142,11 @@ class Client(Methods, BaseClient):
         plugins (``dict``, *optional*):
             Your Smart Plugins settings as dict, e.g.: *dict(root="plugins")*.
             This is an alternative way to setup plugins if you don't want to use the *config.ini* file.
+
+        parse_mode (``str``, *optional*):
+            The parse mode, can be any of: *"combined"*, for the default combined mode. *"markdown"* or *"md"*
+            to force Markdown-only styles. *"html"* to force HTML-only styles. *None* to disable the parser
+            completely.
 
         no_updates (``bool``, *optional*):
             Pass True to completely disable incoming updates for the current session.
@@ -183,6 +189,7 @@ class Client(Methods, BaseClient):
         workdir: str = BaseClient.WORKDIR,
         config_file: str = BaseClient.CONFIG_FILE,
         plugins: dict = None,
+        parse_mode: str = BaseClient.PARSE_MODES[0],
         no_updates: bool = None,
         takeout: bool = None,
         sleep_threshold: int = Session.SLEEP_THRESHOLD
@@ -209,6 +216,7 @@ class Client(Methods, BaseClient):
         self.workdir = Path(workdir)
         self.config_file = Path(config_file)
         self.plugins = plugins
+        self.parse_mode = parse_mode
         self.no_updates = no_updates
         self.takeout = takeout
         self.sleep_threshold = sleep_threshold
@@ -235,6 +243,12 @@ class Client(Methods, BaseClient):
         except ConnectionError:
             pass
 
+    async def __aenter__(self):
+        return await self.start()
+
+    async def __aexit__(self, *args):
+        await self.stop()
+
     @property
     def proxy(self):
         return self._proxy
@@ -251,7 +265,7 @@ class Client(Methods, BaseClient):
         self._proxy["enabled"] = bool(value.get("enabled", True))
         self._proxy.update(value)
 
-    def connect(self) -> bool:
+    async def connect(self) -> bool:
         """
         Connect the client to Telegram servers.
 
@@ -266,16 +280,17 @@ class Client(Methods, BaseClient):
             raise ConnectionError("Client is already connected")
 
         self.load_config()
-        self.load_session()
+        await self.load_session()
 
         self.session = Session(self, self.storage.dc_id(), self.storage.auth_key())
-        self.session.start()
+
+        await self.session.start()
 
         self.is_connected = True
 
         return bool(self.storage.user_id())
 
-    def disconnect(self):
+    async def disconnect(self):
         """Disconnect the client from Telegram servers.
 
         Raises:
@@ -288,11 +303,11 @@ class Client(Methods, BaseClient):
         if self.is_initialized:
             raise ConnectionError("Can't disconnect an initialized client")
 
-        self.session.stop()
+        await self.session.stop()
         self.storage.close()
         self.is_connected = False
 
-    def initialize(self):
+    async def initialize(self):
         """Initialize the client by starting up workers.
 
         This method will start updates and download workers.
@@ -311,33 +326,26 @@ class Client(Methods, BaseClient):
         self.load_plugins()
 
         if not self.no_updates:
-            for i in range(self.UPDATES_WORKERS):
-                self.updates_workers_list.append(
-                    Thread(
-                        target=self.updates_worker,
-                        name="UpdatesWorker#{}".format(i + 1)
-                    )
+            for _ in range(Client.UPDATES_WORKERS):
+                self.updates_worker_tasks.append(
+                    asyncio.ensure_future(self.updates_worker())
                 )
 
-                self.updates_workers_list[-1].start()
+        logging.info("Started {} UpdatesWorkerTasks".format(Client.UPDATES_WORKERS))
 
-        for i in range(self.DOWNLOAD_WORKERS):
-            self.download_workers_list.append(
-                Thread(
-                    target=self.download_worker,
-                    name="DownloadWorker#{}".format(i + 1)
-                )
+        for _ in range(Client.DOWNLOAD_WORKERS):
+            self.download_worker_tasks.append(
+                asyncio.ensure_future(self.download_worker())
             )
 
-            self.download_workers_list[-1].start()
+        logging.info("Started {} DownloadWorkerTasks".format(Client.DOWNLOAD_WORKERS))
 
-        self.dispatcher.start()
-
-        Syncer.add(self)
+        await self.dispatcher.start()
+        await Syncer.add(self)
 
         self.is_initialized = True
 
-    def terminate(self):
+    async def terminate(self):
         """Terminate the client by shutting down workers.
 
         This method does the opposite of :meth:`~Client.initialize`.
@@ -350,37 +358,41 @@ class Client(Methods, BaseClient):
             raise ConnectionError("Client is already terminated")
 
         if self.takeout_id:
-            self.send(functions.account.FinishTakeoutSession())
+            await self.send(functions.account.FinishTakeoutSession())
             log.warning("Takeout session {} finished".format(self.takeout_id))
 
-        Syncer.remove(self)
-        self.dispatcher.stop()
+        await Syncer.remove(self)
+        await self.dispatcher.stop()
 
-        for _ in range(self.DOWNLOAD_WORKERS):
-            self.download_queue.put(None)
+        for _ in range(Client.DOWNLOAD_WORKERS):
+            self.download_queue.put_nowait(None)
 
-        for i in self.download_workers_list:
-            i.join()
+        for task in self.download_worker_tasks:
+            await task
 
-        self.download_workers_list.clear()
+        self.download_worker_tasks.clear()
+
+        logging.info("Stopped {} DownloadWorkerTasks".format(Client.DOWNLOAD_WORKERS))
 
         if not self.no_updates:
-            for _ in range(self.UPDATES_WORKERS):
-                self.updates_queue.put(None)
+            for _ in range(Client.UPDATES_WORKERS):
+                self.updates_queue.put_nowait(None)
 
-            for i in self.updates_workers_list:
-                i.join()
+            for task in self.updates_worker_tasks:
+                await task
 
-            self.updates_workers_list.clear()
+            self.updates_worker_tasks.clear()
 
-        for i in self.media_sessions.values():
-            i.stop()
+        logging.info("Stopped {} UpdatesWorkerTasks".format(Client.UPDATES_WORKERS))
+
+        for media_session in self.media_sessions.values():
+            await media_session.stop()
 
         self.media_sessions.clear()
 
         self.is_initialized = False
 
-    def send_code(self, phone_number: str) -> SentCode:
+    async def send_code(self, phone_number: str) -> SentCode:
         """Send the confirmation code to the given phone number.
 
         Parameters:
@@ -397,7 +409,7 @@ class Client(Methods, BaseClient):
 
         while True:
             try:
-                r = self.send(
+                r = await self.send(
                     functions.auth.SendCode(
                         phone_number=phone_number,
                         api_id=self.api_id,
@@ -406,17 +418,17 @@ class Client(Methods, BaseClient):
                     )
                 )
             except (PhoneMigrate, NetworkMigrate) as e:
-                self.session.stop()
+                await self.session.stop()
 
                 self.storage.dc_id(e.x)
-                self.storage.auth_key(Auth(self, self.storage.dc_id()).create())
+                self.storage.auth_key(await Auth(self, self.storage.dc_id()).create())
                 self.session = Session(self, self.storage.dc_id(), self.storage.auth_key())
 
-                self.session.start()
+                await self.session.start()
             else:
                 return SentCode._parse(r)
 
-    def resend_code(self, phone_number: str, phone_code_hash: str) -> SentCode:
+    async def resend_code(self, phone_number: str, phone_code_hash: str) -> SentCode:
         """Re-send the confirmation code using a different type.
 
         The type of the code to be re-sent is specified in the *next_type* attribute of the :obj:`SentCode` object
@@ -437,7 +449,7 @@ class Client(Methods, BaseClient):
         """
         phone_number = phone_number.strip(" +")
 
-        r = self.send(
+        r = await self.send(
             functions.auth.ResendCode(
                 phone_number=phone_number,
                 phone_code_hash=phone_code_hash
@@ -446,7 +458,8 @@ class Client(Methods, BaseClient):
 
         return SentCode._parse(r)
 
-    def sign_in(self, phone_number: str, phone_code_hash: str, phone_code: str) -> Union[User, TermsOfService, bool]:
+    async def sign_in(self, phone_number: str, phone_code_hash: str, phone_code: str) -> Union[
+        User, TermsOfService, bool]:
         """Authorize a user in Telegram with a valid confirmation code.
 
         Parameters:
@@ -471,7 +484,7 @@ class Client(Methods, BaseClient):
         """
         phone_number = phone_number.strip(" +")
 
-        r = self.send(
+        r = await self.send(
             functions.auth.SignIn(
                 phone_number=phone_number,
                 phone_code_hash=phone_code_hash,
@@ -490,7 +503,7 @@ class Client(Methods, BaseClient):
 
             return User._parse(self, r.user)
 
-    def sign_up(self, phone_number: str, phone_code_hash: str, first_name: str, last_name: str = "") -> User:
+    async def sign_up(self, phone_number: str, phone_code_hash: str, first_name: str, last_name: str = "") -> User:
         """Register a new user in Telegram.
 
         Parameters:
@@ -514,7 +527,7 @@ class Client(Methods, BaseClient):
         """
         phone_number = phone_number.strip(" +")
 
-        r = self.send(
+        r = await self.send(
             functions.auth.SignUp(
                 phone_number=phone_number,
                 first_name=first_name,
@@ -528,7 +541,7 @@ class Client(Methods, BaseClient):
 
         return User._parse(self, r.user)
 
-    def sign_in_bot(self, bot_token: str) -> User:
+    async def sign_in_bot(self, bot_token: str) -> User:
         """Authorize a bot using its bot token generated by BotFather.
 
         Parameters:
@@ -543,7 +556,7 @@ class Client(Methods, BaseClient):
         """
         while True:
             try:
-                r = self.send(
+                r = await self.send(
                     functions.auth.ImportBotAuthorization(
                         flags=0,
                         api_id=self.api_id,
@@ -552,28 +565,28 @@ class Client(Methods, BaseClient):
                     )
                 )
             except UserMigrate as e:
-                self.session.stop()
+                await self.session.stop()
 
                 self.storage.dc_id(e.x)
-                self.storage.auth_key(Auth(self, self.storage.dc_id()).create())
+                self.storage.auth_key(await Auth(self, self.storage.dc_id()).create())
                 self.session = Session(self, self.storage.dc_id(), self.storage.auth_key())
 
-                self.session.start()
+                await self.session.start()
             else:
                 self.storage.user_id(r.user.id)
                 self.storage.is_bot(True)
 
                 return User._parse(self, r.user)
 
-    def get_password_hint(self) -> str:
+    async def get_password_hint(self) -> str:
         """Get your Two-Step Verification password hint.
 
         Returns:
             ``str``: On success, the password hint as string is returned.
         """
-        return self.send(functions.account.GetPassword()).hint
+        return (await self.send(functions.account.GetPassword())).hint
 
-    def check_password(self, password: str) -> User:
+    async def check_password(self, password: str) -> User:
         """Check your Two-Step Verification password and log in.
 
         Parameters:
@@ -586,10 +599,10 @@ class Client(Methods, BaseClient):
         Raises:
             BadRequest: In case the password is invalid.
         """
-        r = self.send(
+        r = await self.send(
             functions.auth.CheckPassword(
                 password=compute_check(
-                    self.send(functions.account.GetPassword()),
+                    await self.send(functions.account.GetPassword()),
                     password
                 )
             )
@@ -600,7 +613,7 @@ class Client(Methods, BaseClient):
 
         return User._parse(self, r.user)
 
-    def send_recovery_code(self) -> str:
+    async def send_recovery_code(self) -> str:
         """Send a code to your email to recover your password.
 
         Returns:
@@ -609,11 +622,11 @@ class Client(Methods, BaseClient):
         Raises:
             BadRequest: In case no recovery email was set up.
         """
-        return self.send(
+        return (await self.send(
             functions.auth.RequestPasswordRecovery()
-        ).email_pattern
+        )).email_pattern
 
-    def recover_password(self, recovery_code: str) -> User:
+    async def recover_password(self, recovery_code: str) -> User:
         """Recover your password with a recovery code and log in.
 
         Parameters:
@@ -626,7 +639,7 @@ class Client(Methods, BaseClient):
         Raises:
             BadRequest: In case the recovery code is invalid.
         """
-        r = self.send(
+        r = await self.send(
             functions.auth.RecoverPassword(
                 code=recovery_code
             )
@@ -637,14 +650,14 @@ class Client(Methods, BaseClient):
 
         return User._parse(self, r.user)
 
-    def accept_terms_of_service(self, terms_of_service_id: str) -> bool:
+    async def accept_terms_of_service(self, terms_of_service_id: str) -> bool:
         """Accept the given terms of service.
 
         Parameters:
             terms_of_service_id (``str``):
                 The terms of service identifier.
         """
-        r = self.send(
+        r = await self.send(
             functions.help.AcceptTermsOfService(
                 id=types.DataJSON(
                     data=terms_of_service_id
@@ -656,15 +669,15 @@ class Client(Methods, BaseClient):
 
         return True
 
-    def authorize(self) -> User:
+    async def authorize(self) -> User:
         if self.bot_token:
-            return self.sign_in_bot(self.bot_token)
+            return await self.sign_in_bot(self.bot_token)
 
         while True:
             try:
                 if not self.phone_number:
                     while True:
-                        value = input("Enter phone number or bot token: ")
+                        value = await ainput("Enter phone number or bot token: ")
 
                         if not value:
                             continue
@@ -676,11 +689,11 @@ class Client(Methods, BaseClient):
 
                     if ":" in value:
                         self.bot_token = value
-                        return self.sign_in_bot(value)
+                        return await self.sign_in_bot(value)
                     else:
                         self.phone_number = value
 
-                sent_code = self.send_code(self.phone_number)
+                sent_code = await self.send_code(self.phone_number)
             except BadRequest as e:
                 print(e.MESSAGE)
                 self.phone_number = None
@@ -689,7 +702,7 @@ class Client(Methods, BaseClient):
                 break
 
         if self.force_sms:
-            sent_code = self.resend_code(self.phone_number, sent_code.phone_code_hash)
+            sent_code = await self.resend_code(self.phone_number, sent_code.phone_code_hash)
 
         print("The confirmation code has been sent via {}".format(
             {
@@ -702,10 +715,10 @@ class Client(Methods, BaseClient):
 
         while True:
             if not self.phone_code:
-                self.phone_code = input("Enter confirmation code: ")
+                self.phone_code = await ainput("Enter confirmation code: ")
 
             try:
-                signed_in = self.sign_in(self.phone_number, sent_code.phone_code_hash, self.phone_code)
+                signed_in = await self.sign_in(self.phone_number, sent_code.phone_code_hash, self.phone_code)
             except BadRequest as e:
                 print(e.MESSAGE)
                 self.phone_code = None
@@ -713,24 +726,24 @@ class Client(Methods, BaseClient):
                 print(e.MESSAGE)
 
                 while True:
-                    print("Password hint: {}".format(self.get_password_hint()))
+                    print("Password hint: {}".format(await self.get_password_hint()))
 
                     if not self.password:
-                        self.password = input("Enter password (empty to recover): ")
+                        self.password = await ainput("Enter password (empty to recover): ")
 
                     try:
                         if not self.password:
-                            confirm = input("Confirm password recovery (y/n): ")
+                            confirm = await ainput("Confirm password recovery (y/n): ")
 
                             if confirm == "y":
-                                email_pattern = self.send_recovery_code()
+                                email_pattern = await self.send_recovery_code()
                                 print("The recovery code has been sent to {}".format(email_pattern))
 
                                 while True:
-                                    recovery_code = input("Enter recovery code: ")
+                                    recovery_code = await ainput("Enter recovery code: ")
 
                                     try:
-                                        return self.recover_password(recovery_code)
+                                        return await self.recover_password(recovery_code)
                                     except BadRequest as e:
                                         print(e.MESSAGE)
                                     except Exception as e:
@@ -739,7 +752,7 @@ class Client(Methods, BaseClient):
                             else:
                                 self.password = None
                         else:
-                            return self.check_password(self.password)
+                            return await self.check_password(self.password)
                     except BadRequest as e:
                         print(e.MESSAGE)
                         self.password = None
@@ -750,11 +763,11 @@ class Client(Methods, BaseClient):
             return signed_in
 
         while True:
-            first_name = input("Enter first name: ")
-            last_name = input("Enter last name (empty to skip): ")
+            first_name = await ainput("Enter first name: ")
+            last_name = await ainput("Enter last name (empty to skip): ")
 
             try:
-                signed_up = self.sign_up(
+                signed_up = await self.sign_up(
                     self.phone_number,
                     sent_code.phone_code_hash,
                     first_name,
@@ -767,11 +780,11 @@ class Client(Methods, BaseClient):
 
         if isinstance(signed_in, TermsOfService):
             print("\n" + signed_in.text + "\n")
-            self.accept_terms_of_service(signed_in.id)
+            await self.accept_terms_of_service(signed_in.id)
 
         return signed_up
 
-    def log_out(self):
+    async def log_out(self):
         """Log out from Telegram and delete the *\\*.session* file.
 
         When you log out, the current client is stopped and the storage session deleted.
@@ -786,13 +799,13 @@ class Client(Methods, BaseClient):
                 # Log out.
                 app.log_out()
         """
-        self.send(functions.auth.LogOut())
-        self.stop()
+        await self.send(functions.auth.LogOut())
+        await self.stop()
         self.storage.delete()
 
         return True
 
-    def start(self):
+    async def start(self):
         """Start the client.
 
         This method connects the client to Telegram and, in case of new sessions, automatically manages the full
@@ -817,25 +830,25 @@ class Client(Methods, BaseClient):
 
                 app.stop()
         """
-        is_authorized = self.connect()
+        is_authorized = await self.connect()
 
         try:
             if not is_authorized:
-                self.authorize()
+                await self.authorize()
 
             if not self.storage.is_bot() and self.takeout:
-                self.takeout_id = self.send(functions.account.InitTakeoutSession()).id
+                self.takeout_id = (await self.send(functions.account.InitTakeoutSession())).id
                 log.warning("Takeout session {} initiated".format(self.takeout_id))
 
-            self.send(functions.updates.GetState())
+            await self.send(functions.updates.GetState())
         except (Exception, KeyboardInterrupt):
-            self.disconnect()
+            await self.disconnect()
             raise
         else:
-            self.initialize()
+            await self.initialize()
             return self
 
-    def stop(self, block: bool = True):
+    async def stop(self, block: bool = True):
         """Stop the Client.
 
         This method disconnects the client from Telegram and stops the underlying tasks.
@@ -866,18 +879,18 @@ class Client(Methods, BaseClient):
                 app.stop()
         """
 
-        def do_it():
-            self.terminate()
-            self.disconnect()
+        async def do_it():
+            await self.terminate()
+            await self.disconnect()
 
         if block:
-            do_it()
+            await do_it()
         else:
-            Thread(target=do_it).start()
+            asyncio.ensure_future(do_it())
 
         return self
 
-    def restart(self, block: bool = True):
+    async def restart(self, block: bool = True):
         """Restart the Client.
 
         This method will first call :meth:`~Client.stop` and then :meth:`~Client.start` in a row in order to restart
@@ -913,19 +926,19 @@ class Client(Methods, BaseClient):
                 app.stop()
         """
 
-        def do_it():
-            self.stop()
-            self.start()
+        async def do_it():
+            await self.stop()
+            await self.start()
 
         if block:
-            do_it()
+            await do_it()
         else:
-            Thread(target=do_it).start()
+            asyncio.ensure_future(do_it())
 
         return self
 
     @staticmethod
-    def idle(stop_signals: tuple = (SIGINT, SIGTERM, SIGABRT)):
+    async def idle(stop_signals: tuple = (SIGINT, SIGTERM, SIGABRT)):
         """Block the main script execution until a signal is received.
 
         This static method will run an infinite loop in order to block the main script execution and prevent it from
@@ -970,6 +983,7 @@ class Client(Methods, BaseClient):
         """
 
         def signal_handler(_, __):
+            logging.info("Stop signal received ({}). Exiting...".format(_))
             Client.is_idling = False
 
         for s in stop_signals:
@@ -978,9 +992,9 @@ class Client(Methods, BaseClient):
         Client.is_idling = True
 
         while Client.is_idling:
-            time.sleep(1)
+            await asyncio.sleep(1)
 
-    def run(self):
+    def run(self, coroutine=None):
         """Start the client, idle the main script and finally stop the client.
 
         This is a convenience method that calls :meth:`~Client.start`, :meth:`~Client.idle` and :meth:`~Client.stop` in
@@ -1002,9 +1016,17 @@ class Client(Methods, BaseClient):
 
                 app.run()
         """
-        self.start()
-        Client.idle()
-        self.stop()
+        loop = asyncio.get_event_loop()
+        run = loop.run_until_complete
+
+        if coroutine is not None:
+            run(coroutine)
+        else:
+            run(self.start())
+            run(Client.idle())
+            run(self.stop())
+
+        loop.close()
 
     def add_handler(self, handler: Handler, group: int = 0):
         """Register an update handler.
@@ -1130,6 +1152,21 @@ class Client(Methods, BaseClient):
         """
         return self.storage.export_session_string()
 
+    @property
+    def parse_mode(self):
+        return self._parse_mode
+
+    @parse_mode.setter
+    def parse_mode(self, parse_mode: Union[str, None] = "combined"):
+        if parse_mode not in self.PARSE_MODES:
+            raise ValueError('parse_mode must be one of {} or None. Not "{}"'.format(
+                ", ".join('"{}"'.format(m) for m in self.PARSE_MODES[:-1]),
+                parse_mode
+            ))
+
+        self._parse_mode = parse_mode
+
+    # TODO: redundant, remove in next major version
     def set_parse_mode(self, parse_mode: Union[str, None] = "combined"):
         """Set the parse mode to be used globally by the client.
 
@@ -1175,12 +1212,6 @@ class Client(Methods, BaseClient):
                     app.send_message("haskell", "5. **markdown** and <i>html</i>")
         """
 
-        if parse_mode not in self.PARSE_MODES:
-            raise ValueError('parse_mode must be one of {} or None. Not "{}"'.format(
-                ", ".join('"{}"'.format(m) for m in self.PARSE_MODES[:-1]),
-                parse_mode
-            ))
-
         self.parse_mode = parse_mode
 
     def fetch_peers(self, peers: List[Union[types.User, types.Chat, types.Channel]]) -> bool:
@@ -1219,12 +1250,9 @@ class Client(Methods, BaseClient):
 
         return is_min
 
-    def download_worker(self):
-        name = threading.current_thread().name
-        log.debug("{} started".format(name))
-
+    async def download_worker(self):
         while True:
-            packet = self.download_queue.get()
+            packet = await self.download_queue.get()
 
             if packet is None:
                 break
@@ -1235,7 +1263,7 @@ class Client(Methods, BaseClient):
             try:
                 data, directory, file_name, done, progress, progress_args, path = packet
 
-                temp_file_path = self.get_file(
+                temp_file_path = await self.get_file(
                     media_type=data.media_type,
                     dc_id=data.dc_id,
                     document_id=data.document_id,
@@ -1272,14 +1300,9 @@ class Client(Methods, BaseClient):
             finally:
                 done.set()
 
-        log.debug("{} stopped".format(name))
-
-    def updates_worker(self):
-        name = threading.current_thread().name
-        log.debug("{} started".format(name))
-
+    async def updates_worker(self):
         while True:
-            updates = self.updates_queue.get()
+            updates = await self.updates_queue.get()
 
             if updates is None:
                 break
@@ -1311,9 +1334,9 @@ class Client(Methods, BaseClient):
 
                             if not isinstance(message, types.MessageEmpty):
                                 try:
-                                    diff = self.send(
+                                    diff = await self.send(
                                         functions.updates.GetChannelDifference(
-                                            channel=self.resolve_peer(utils.get_channel_id(channel_id)),
+                                            channel=await self.resolve_peer(utils.get_channel_id(channel_id)),
                                             filter=types.ChannelMessagesFilter(
                                                 ranges=[types.MessageRange(
                                                     min_id=update.message.id,
@@ -1331,9 +1354,9 @@ class Client(Methods, BaseClient):
                                         users.update({u.id: u for u in diff.users})
                                         chats.update({c.id: c for c in diff.chats})
 
-                        self.dispatcher.updates_queue.put((update, users, chats))
+                        self.dispatcher.updates_queue.put_nowait((update, users, chats))
                 elif isinstance(updates, (types.UpdateShortMessage, types.UpdateShortChatMessage)):
-                    diff = self.send(
+                    diff = await self.send(
                         functions.updates.GetDifference(
                             pts=updates.pts - updates.pts_count,
                             date=updates.date,
@@ -1342,7 +1365,7 @@ class Client(Methods, BaseClient):
                     )
 
                     if diff.new_messages:
-                        self.dispatcher.updates_queue.put((
+                        self.dispatcher.updates_queue.put_nowait((
                             types.UpdateNewMessage(
                                 message=diff.new_messages[0],
                                 pts=updates.pts,
@@ -1352,17 +1375,15 @@ class Client(Methods, BaseClient):
                             {c.id: c for c in diff.chats}
                         ))
                     else:
-                        self.dispatcher.updates_queue.put((diff.other_updates[0], {}, {}))
+                        self.dispatcher.updates_queue.put_nowait((diff.other_updates[0], {}, {}))
                 elif isinstance(updates, types.UpdateShort):
-                    self.dispatcher.updates_queue.put((updates.update, {}, {}))
+                    self.dispatcher.updates_queue.put_nowait((updates.update, {}, {}))
                 elif isinstance(updates, types.UpdatesTooLong):
                     log.info(updates)
             except Exception as e:
                 log.error(e, exc_info=True)
 
-        log.debug("{} stopped".format(name))
-
-    def send(self, data: TLObject, retries: int = Session.MAX_RETRIES, timeout: float = Session.WAIT_TIMEOUT):
+    async def send(self, data: TLObject, retries: int = Session.MAX_RETRIES, timeout: float = Session.WAIT_TIMEOUT):
         """Send raw Telegram queries.
 
         This method makes it possible to manually call every single Telegram API method in a low-level manner.
@@ -1400,7 +1421,7 @@ class Client(Methods, BaseClient):
         if self.takeout_id:
             data = functions.InvokeWithTakeout(takeout_id=self.takeout_id, query=data)
 
-        r = self.session.send(data, retries, timeout, self.sleep_threshold)
+        r = await self.session.send(data, retries, timeout, self.sleep_threshold)
 
         self.fetch_peers(getattr(r, "users", []))
         self.fetch_peers(getattr(r, "chats", []))
@@ -1480,7 +1501,7 @@ class Client(Methods, BaseClient):
             except KeyError:
                 self.plugins = None
 
-    def load_session(self):
+    async def load_session(self):
         self.storage.open()
 
         session_empty = any([
@@ -1495,7 +1516,7 @@ class Client(Methods, BaseClient):
             self.storage.date(0)
 
             self.storage.test_mode(self.test_mode)
-            self.storage.auth_key(Auth(self, self.storage.dc_id()).create())
+            self.storage.auth_key(await Auth(self, self.storage.dc_id()).create())
             self.storage.user_id(None)
             self.storage.is_bot(None)
 
@@ -1522,7 +1543,7 @@ class Client(Methods, BaseClient):
             if not include:
                 for path in sorted(Path(root.replace(".", "/")).rglob("*.py")):
                     module_path = '.'.join(path.parent.parts + (path.stem,))
-                    module = reload(import_module(module_path))
+                    module = import_module(module_path)
 
                     for name in vars(module).keys():
                         # noinspection PyBroadException
@@ -1544,7 +1565,7 @@ class Client(Methods, BaseClient):
                     warn_non_existent_functions = True
 
                     try:
-                        module = reload(import_module(module_path))
+                        module = import_module(module_path)
                     except ImportError:
                         log.warning('[{}] [LOAD] Ignoring non-existent module "{}"'.format(
                             self.session_name, module_path))
@@ -1615,13 +1636,13 @@ class Client(Methods, BaseClient):
                                     self.session_name, name, module_path))
 
             if count > 0:
-                log.warning('[{}] Successfully loaded {} plugin{} from "{}"'.format(
+                log.info('[{}] Successfully loaded {} plugin{} from "{}"'.format(
                     self.session_name, count, "s" if count > 1 else "", root))
             else:
                 log.warning('[{}] No plugin loaded from "{}"'.format(
                     self.session_name, root))
 
-    def resolve_peer(self, peer_id: Union[int, str]):
+    async def resolve_peer(self, peer_id: Union[int, str]):
         """Get the InputPeer of a known peer id.
         Useful whenever an InputPeer type is required.
 
@@ -1648,7 +1669,7 @@ class Client(Methods, BaseClient):
         try:
             return self.storage.get_peer_by_id(peer_id)
         except KeyError:
-            if type(peer_id) is str:
+            if isinstance(peer_id, str):
                 if peer_id in ("self", "me"):
                     return types.InputPeerSelf()
 
@@ -1660,7 +1681,7 @@ class Client(Methods, BaseClient):
                     try:
                         return self.storage.get_peer_by_username(peer_id)
                     except KeyError:
-                        self.send(
+                        await self.send(
                             functions.contacts.ResolveUsername(
                                 username=peer_id
                             )
@@ -1677,7 +1698,7 @@ class Client(Methods, BaseClient):
 
             if peer_type == "user":
                 self.fetch_peers(
-                    self.send(
+                    await self.send(
                         functions.users.GetUsers(
                             id=[
                                 types.InputUser(
@@ -1689,13 +1710,13 @@ class Client(Methods, BaseClient):
                     )
                 )
             elif peer_type == "chat":
-                self.send(
+                await self.send(
                     functions.messages.GetChats(
                         id=[-peer_id]
                     )
                 )
             else:
-                self.send(
+                await self.send(
                     functions.channels.GetChannels(
                         id=[
                             types.InputChannel(
@@ -1711,9 +1732,9 @@ class Client(Methods, BaseClient):
             except KeyError:
                 raise PeerIdInvalid
 
-    def save_file(
+    async def save_file(
         self,
-        path: str,
+        path: Union[str, BinaryIO],
         file_id: int = None,
         file_part: int = 0,
         progress: callable = None,
@@ -1766,55 +1787,83 @@ class Client(Methods, BaseClient):
         Raises:
             RPCError: In case of a Telegram RPC error.
         """
+        if path is None:
+            return None
+
+        async def worker(session):
+            while True:
+                data = await queue.get()
+
+                if data is None:
+                    return
+
+                try:
+                    await asyncio.ensure_future(session.send(data))
+                except Exception as e:
+                    logging.error(e)
+
         part_size = 512 * 1024
-        file_size = os.path.getsize(path)
+
+        if isinstance(path, (str, PurePath)):
+            fp = open(path, "rb")
+        elif isinstance(path, io.IOBase):
+            fp = path
+        else:
+            raise ValueError("Invalid file. Expected a file path as string or a binary (not text) file pointer")
+
+        file_name = fp.name
+
+        fp.seek(0, os.SEEK_END)
+        file_size = fp.tell()
+        fp.seek(0)
 
         if file_size == 0:
             raise ValueError("File size equals to 0 B")
 
-        if file_size > 1500 * 1024 * 1024:
-            raise ValueError("Telegram doesn't support uploading files bigger than 1500 MiB")
+        if file_size > 2000 * 1024 * 1024:
+            raise ValueError("Telegram doesn't support uploading files bigger than 2000 MiB")
 
         file_total_parts = int(math.ceil(file_size / part_size))
-        is_big = True if file_size > 10 * 1024 * 1024 else False
-        is_missing_part = True if file_id is not None else False
+        is_big = file_size > 10 * 1024 * 1024
+        pool_size = 3 if is_big else 1
+        workers_count = 4 if is_big else 1
+        is_missing_part = file_id is not None
         file_id = file_id or self.rnd_id()
         md5_sum = md5() if not is_big and not is_missing_part else None
-
-        session = Session(self, self.storage.dc_id(), self.storage.auth_key(), is_media=True)
-        session.start()
+        pool = [Session(self, self.storage.dc_id(), self.storage.auth_key(), is_media=True) for _ in range(pool_size)]
+        workers = [asyncio.ensure_future(worker(session)) for session in pool for _ in range(workers_count)]
+        queue = asyncio.Queue(16)
 
         try:
-            with open(path, "rb") as f:
-                f.seek(part_size * file_part)
+            for session in pool:
+                await session.start()
+
+            with fp:
+                fp.seek(part_size * file_part)
 
                 while True:
-                    chunk = f.read(part_size)
+                    chunk = fp.read(part_size)
 
                     if not chunk:
                         if not is_big:
                             md5_sum = "".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
                         break
 
-                    for _ in range(3):
-                        if is_big:
-                            rpc = functions.upload.SaveBigFilePart(
-                                file_id=file_id,
-                                file_part=file_part,
-                                file_total_parts=file_total_parts,
-                                bytes=chunk
-                            )
-                        else:
-                            rpc = functions.upload.SaveFilePart(
-                                file_id=file_id,
-                                file_part=file_part,
-                                bytes=chunk
-                            )
-
-                        if session.send(rpc):
-                            break
+                    if is_big:
+                        rpc = functions.upload.SaveBigFilePart(
+                            file_id=file_id,
+                            file_part=file_part,
+                            file_total_parts=file_total_parts,
+                            bytes=chunk
+                        )
                     else:
-                        raise AssertionError("Telegram didn't accept chunk #{} of {}".format(file_part, path))
+                        rpc = functions.upload.SaveFilePart(
+                            file_id=file_id,
+                            file_part=file_part,
+                            bytes=chunk
+                        )
+
+                    await queue.put(rpc)
 
                     if is_missing_part:
                         return
@@ -1825,7 +1874,7 @@ class Client(Methods, BaseClient):
                     file_part += 1
 
                     if progress:
-                        progress(min(file_part * part_size, file_size), file_size, *progress_args)
+                        await progress(min(file_part * part_size, file_size), file_size, *progress_args)
         except Client.StopTransmission:
             raise
         except Exception as e:
@@ -1835,20 +1884,26 @@ class Client(Methods, BaseClient):
                 return types.InputFileBig(
                     id=file_id,
                     parts=file_total_parts,
-                    name=os.path.basename(path),
+                    name=file_name,
 
                 )
             else:
                 return types.InputFile(
                     id=file_id,
                     parts=file_total_parts,
-                    name=os.path.basename(path),
+                    name=file_name,
                     md5_checksum=md5_sum
                 )
         finally:
-            session.stop()
+            for _ in workers:
+                await queue.put(None)
 
-    def get_file(
+            await asyncio.gather(*workers)
+
+            for session in pool:
+                await session.stop()
+
+    async def get_file(
         self,
         media_type: int,
         dc_id: int,
@@ -1866,23 +1921,23 @@ class Client(Methods, BaseClient):
         progress: callable,
         progress_args: tuple = ()
     ) -> str:
-        with self.media_sessions_lock:
+        async with self.media_sessions_lock:
             session = self.media_sessions.get(dc_id, None)
 
             if session is None:
                 if dc_id != self.storage.dc_id():
-                    session = Session(self, dc_id, Auth(self, dc_id).create(), is_media=True)
-                    session.start()
+                    session = Session(self, dc_id, await Auth(self, dc_id).create(), is_media=True)
+                    await session.start()
 
                     for _ in range(3):
-                        exported_auth = self.send(
+                        exported_auth = await self.send(
                             functions.auth.ExportAuthorization(
                                 dc_id=dc_id
                             )
                         )
 
                         try:
-                            session.send(
+                            await session.send(
                                 functions.auth.ImportAuthorization(
                                     id=exported_auth.id,
                                     bytes=exported_auth.bytes
@@ -1893,11 +1948,11 @@ class Client(Methods, BaseClient):
                         else:
                             break
                     else:
-                        session.stop()
+                        await session.stop()
                         raise AuthBytesInvalid
                 else:
                     session = Session(self, dc_id, self.storage.auth_key(), is_media=True)
-                    session.start()
+                    await session.start()
 
                 self.media_sessions[dc_id] = session
 
@@ -1952,7 +2007,7 @@ class Client(Methods, BaseClient):
         file_name = ""
 
         try:
-            r = session.send(
+            r = await session.send(
                 functions.upload.GetFile(
                     location=location,
                     offset=offset,
@@ -1975,7 +2030,7 @@ class Client(Methods, BaseClient):
                         offset += limit
 
                         if progress:
-                            progress(
+                            await progress(
                                 min(offset, file_size)
                                 if file_size != 0
                                 else offset,
@@ -1983,7 +2038,7 @@ class Client(Methods, BaseClient):
                                 *progress_args
                             )
 
-                        r = session.send(
+                        r = await session.send(
                             functions.upload.GetFile(
                                 location=location,
                                 offset=offset,
@@ -1992,13 +2047,16 @@ class Client(Methods, BaseClient):
                         )
 
             elif isinstance(r, types.upload.FileCdnRedirect):
-                with self.media_sessions_lock:
+                async with self.media_sessions_lock:
                     cdn_session = self.media_sessions.get(r.dc_id, None)
 
                     if cdn_session is None:
-                        cdn_session = Session(self, r.dc_id, Auth(self, r.dc_id).create(), is_media=True, is_cdn=True)
+                        cdn_session = Session(
+                            self,
+                            r.dc_id,
+                            await Auth(self, r.dc_id).create(), is_media=True, is_cdn=True)
 
-                        cdn_session.start()
+                        await cdn_session.start()
 
                         self.media_sessions[r.dc_id] = cdn_session
 
@@ -2007,7 +2065,7 @@ class Client(Methods, BaseClient):
                         file_name = f.name
 
                         while True:
-                            r2 = cdn_session.send(
+                            r2 = await cdn_session.send(
                                 functions.upload.GetCdnFile(
                                     file_token=r.file_token,
                                     offset=offset,
@@ -2017,7 +2075,7 @@ class Client(Methods, BaseClient):
 
                             if isinstance(r2, types.upload.CdnFileReuploadNeeded):
                                 try:
-                                    session.send(
+                                    await session.send(
                                         functions.upload.ReuploadCdnFile(
                                             file_token=r.file_token,
                                             request_token=r2.request_token
@@ -2040,7 +2098,7 @@ class Client(Methods, BaseClient):
                                 )
                             )
 
-                            hashes = session.send(
+                            hashes = await session.send(
                                 functions.upload.GetCdnFileHashes(
                                     file_token=r.file_token,
                                     offset=offset
@@ -2057,7 +2115,7 @@ class Client(Methods, BaseClient):
                             offset += limit
 
                             if progress:
-                                progress(
+                                await progress(
                                     min(offset, file_size)
                                     if file_size != 0
                                     else offset,

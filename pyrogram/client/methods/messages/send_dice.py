@@ -24,7 +24,7 @@ from pyrogram.client.ext import BaseClient
 
 
 class SendDice(BaseClient):
-    def send_dice(
+    async def send_dice(
         self,
         chat_id: Union[int, str],
         emoji: str = "🎲",
@@ -47,7 +47,7 @@ class SendDice(BaseClient):
                 For a contact that exists in your Telegram address book you can use his phone number (str).
 
             emoji (``str``, *optional*):
-                Emoji on which the dice throw animation is based. Currently, must be one of "🎲",  "🎯" or "🏀".
+                Emoji on which the dice throw animation is based. Currently, must be one of "🎲",  "🎯", "🏀" or "⚽️".
                 Defaults to "🎲".
 
             disable_notification (``bool``, *optional*):
@@ -80,9 +80,9 @@ class SendDice(BaseClient):
                 app.send_dice("pyrogramlounge", "🏀")
         """
 
-        r = self.send(
+        r = await self.send(
             functions.messages.SendMedia(
-                peer=self.resolve_peer(chat_id),
+                peer=await self.resolve_peer(chat_id),
                 media=types.InputMediaDice(emoticon=emoji),
                 silent=disable_notification or None,
                 reply_to_msg_id=reply_to_message_id,
@@ -94,11 +94,8 @@ class SendDice(BaseClient):
         )
 
         for i in r.updates:
-            if isinstance(
-                i,
-                (types.UpdateNewMessage, types.UpdateNewChannelMessage, types.UpdateNewScheduledMessage)
-            ):
-                return pyrogram.Message._parse(
+            if isinstance(i, (types.UpdateNewMessage, types.UpdateNewChannelMessage, types.UpdateNewScheduledMessage)):
+                return await pyrogram.Message._parse(
                     self, i.message,
                     {i.id: i for i in r.users},
                     {i.id: i for i in r.chats},

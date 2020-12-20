@@ -17,12 +17,10 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 import logging
-import time
 from typing import Union, List
 
 import pyrogram
 from pyrogram.api import functions, types
-from pyrogram.errors import FloodWait
 from ...ext import BaseClient
 
 log = logging.getLogger(__name__)
@@ -38,7 +36,7 @@ class Filters:
 
 
 class GetChatMembers(BaseClient):
-    def get_chat_members(
+    async def get_chat_members(
         self,
         chat_id: Union[int, str],
         offset: int = 0,
@@ -105,10 +103,10 @@ class GetChatMembers(BaseClient):
                 # Get all bots
                 app.get_chat_members("pyrogramchat", filter="bots")
         """
-        peer = self.resolve_peer(chat_id)
+        peer = await self.resolve_peer(chat_id)
 
         if isinstance(peer, types.InputPeerChat):
-            r = self.send(
+            r = await self.send(
                 functions.messages.GetFullChat(
                     chat_id=peer.chat_id
                 )
@@ -136,7 +134,7 @@ class GetChatMembers(BaseClient):
             else:
                 raise ValueError("Invalid filter \"{}\"".format(filter))
 
-            r = self.send(
+            r = await self.send(
                 functions.channels.GetParticipants(
                     channel=peer,
                     filter=filter,

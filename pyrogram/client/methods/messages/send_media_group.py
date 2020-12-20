@@ -18,20 +18,19 @@
 
 import logging
 import os
-import time
+import re
 from typing import Union, List
 
 import pyrogram
 from pyrogram.api import functions, types
 from pyrogram.client.ext import BaseClient, utils
-from pyrogram.errors import FloodWait
 
 log = logging.getLogger(__name__)
 
 
 class SendMediaGroup(BaseClient):
     # TODO: Add progress parameter
-    def send_media_group(
+    async def send_media_group(
         self,
         chat_id: Union[int, str],
         media: List[Union["pyrogram.InputMediaPhoto", "pyrogram.InputMediaVideo"]],
@@ -77,12 +76,12 @@ class SendMediaGroup(BaseClient):
 
         for i in media:
             if isinstance(i, pyrogram.InputMediaPhoto):
-                if os.path.exists(i.media):
-                    media = self.send(
+                if os.path.isfile(i.media):
+                    media = await self.send(
                         functions.messages.UploadMedia(
-                            peer=self.resolve_peer(chat_id),
+                            peer=await self.resolve_peer(chat_id),
                             media=types.InputMediaUploadedPhoto(
-                                file=self.save_file(i.media)
+                                file=await self.save_file(i.media)
                             )
                         )
                     )
@@ -94,10 +93,10 @@ class SendMediaGroup(BaseClient):
                             file_reference=media.photo.file_reference
                         )
                     )
-                elif i.media.startswith("http"):
-                    media = self.send(
+                elif re.match("^https?://", i.media):
+                    media = await self.send(
                         functions.messages.UploadMedia(
-                            peer=self.resolve_peer(chat_id),
+                            peer=await self.resolve_peer(chat_id),
                             media=types.InputMediaPhotoExternal(
                                 url=i.media
                             )
@@ -114,13 +113,13 @@ class SendMediaGroup(BaseClient):
                 else:
                     media = utils.get_input_media_from_file_id(i.media, i.file_ref, 2)
             elif isinstance(i, pyrogram.InputMediaVideo):
-                if os.path.exists(i.media):
-                    media = self.send(
+                if os.path.isfile(i.media):
+                    media = await self.send(
                         functions.messages.UploadMedia(
-                            peer=self.resolve_peer(chat_id),
+                            peer=await self.resolve_peer(chat_id),
                             media=types.InputMediaUploadedDocument(
-                                file=self.save_file(i.media),
-                                thumb=None if i.thumb is None else self.save_file(i.thumb),
+                                file=await self.save_file(i.media),
+                                thumb=self.save_file(i.thumb),
                                 mime_type=self.guess_mime_type(i.media) or "video/mp4",
                                 attributes=[
                                     types.DocumentAttributeVideo(
@@ -142,10 +141,10 @@ class SendMediaGroup(BaseClient):
                             file_reference=media.document.file_reference
                         )
                     )
-                elif i.media.startswith("http"):
-                    media = self.send(
+                elif re.match("^https?://", i.media):
+                    media = await self.send(
                         functions.messages.UploadMedia(
-                            peer=self.resolve_peer(chat_id),
+                            peer=await self.resolve_peer(chat_id),
                             media=types.InputMediaDocumentExternal(
                                 url=i.media
                             )
@@ -166,20 +165,20 @@ class SendMediaGroup(BaseClient):
                 types.InputSingleMedia(
                     media=media,
                     random_id=self.rnd_id(),
-                    **self.parser.parse(i.caption, i.parse_mode)
+                    **await self.parser.parse(i.caption, i.parse_mode)
                 )
             )
 
-        r = self.send(
+        r = await self.send(
             functions.messages.SendMultiMedia(
-                peer=self.resolve_peer(chat_id),
+                peer=await self.resolve_peer(chat_id),
                 multi_media=multi_media,
                 silent=disable_notification or None,
                 reply_to_msg_id=reply_to_message_id
             )
         )
 
-        return utils.parse_messages(
+        return await utils.parse_messages(
             self,
             types.messages.Messages(
                 messages=[m.message for m in filter(

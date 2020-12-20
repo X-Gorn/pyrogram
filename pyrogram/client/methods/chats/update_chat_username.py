@@ -23,13 +23,13 @@ from ...ext import BaseClient
 
 
 class UpdateChatUsername(BaseClient):
-    def update_chat_username(
+    async def update_chat_username(
         self,
         chat_id: Union[int, str],
         username: Union[str, None]
     ) -> bool:
         """Update a channel or a supergroup username.
-        
+
         To update your own username (for users only, not bots) you can use :meth:`~Client.update_username`.
 
         Parameters:
@@ -50,11 +50,11 @@ class UpdateChatUsername(BaseClient):
                 app.update_chat_username(chat_id, "new_username")
         """
 
-        peer = self.resolve_peer(chat_id)
+        peer = await self.resolve_peer(chat_id)
 
         if isinstance(peer, types.InputPeerChannel):
             return bool(
-                self.send(
+                await self.send(
                     functions.channels.UpdateUsername(
                         channel=peer,
                         username=username or ""

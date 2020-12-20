@@ -23,12 +23,12 @@ from ...ext import BaseClient
 
 
 class UpdateUsername(BaseClient):
-    def update_username(
+    async def update_username(
         self,
         username: Union[str, None]
     ) -> bool:
         """Update your own username.
-        
+
         This method only works for users, not bots. Bot usernames must be changed via Bot Support or by recreating
         them from scratch using BotFather. To update a channel or supergroup username you can use
         :meth:`~Client.update_chat_username`.
@@ -47,7 +47,7 @@ class UpdateUsername(BaseClient):
         """
 
         return bool(
-            self.send(
+            await self.send(
                 functions.account.UpdateUsername(
                     username=username or ""
                 )

@@ -24,7 +24,7 @@ from ...ext import BaseClient, utils
 
 
 class GetNearbyChats(BaseClient):
-    def get_nearby_chats(
+    async def get_nearby_chats(
         self,
         latitude: float,
         longitude: float
@@ -48,7 +48,7 @@ class GetNearbyChats(BaseClient):
                 print(chats)
         """
 
-        r = self.send(
+        r = await self.send(
             functions.contacts.GetLocated(
                 geo_point=types.InputGeoPoint(
                     lat=latitude,
@@ -64,11 +64,12 @@ class GetNearbyChats(BaseClient):
         peers = r.updates[0].peers
 
         for peer in peers:
-            chat_id = utils.get_channel_id(peer.peer.channel_id)
+            if isinstance(peer.peer, types.PeerChannel):
+                chat_id = utils.get_channel_id(peer.peer.channel_id)
 
-            for chat in chats:
-                if chat.id == chat_id:
-                    chat.distance = peer.distance
-                    break
+                for chat in chats:
+                    if chat.id == chat_id:
+                        chat.distance = peer.distance
+                        break
 
         return chats

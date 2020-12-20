@@ -24,7 +24,7 @@ from ...ext import BaseClient
 
 
 class GetCommonChats(BaseClient):
-    def get_common_chats(self, user_id: Union[int, str]) -> list:
+    async def get_common_chats(self, user_id: Union[int, str]) -> list:
         """Get the common chats you have with a user.
 
         Parameters:
@@ -35,7 +35,7 @@ class GetCommonChats(BaseClient):
 
         Returns:
             List of :obj:`Chat`: On success, a list of the common chats is returned.
-            
+
         Raises:
             ValueError: If the user_id doesn't belong to a user.
 
@@ -46,10 +46,10 @@ class GetCommonChats(BaseClient):
                 print(common)
         """
 
-        peer = self.resolve_peer(user_id)
+        peer = await self.resolve_peer(user_id)
 
         if isinstance(peer, types.InputPeerUser):
-            r = self.send(
+            r = await self.send(
                 functions.messages.GetCommonChats(
                     user_id=peer,
                     max_id=0,
@@ -58,5 +58,5 @@ class GetCommonChats(BaseClient):
             )
 
             return pyrogram.List([pyrogram.Chat._parse_chat(self, x) for x in r.chats])
-        
+
         raise ValueError('The user_id "{}" doesn\'t belong to a user'.format(user_id))
