@@ -300,7 +300,9 @@ class Client(Methods):
         self.client_platform = client_platform
         self.init_connection_params = init_connection_params
 
-        self.executor = ThreadPoolExecutor(self.workers, thread_name_prefix="Handler")
+        self.handler_executor = ThreadPoolExecutor(self.workers, thread_name_prefix="Handler")
+        self.filter_executor = ThreadPoolExecutor(self.workers, thread_name_prefix="Filter")
+        self.progress_executor = ThreadPoolExecutor(self.workers, thread_name_prefix="Progress")
 
         self.storage: Storage
 
@@ -1006,7 +1008,7 @@ class Client(Methods):
                             if inspect.iscoroutinefunction(progress):
                                 await func()
                             else:
-                                await self.loop.run_in_executor(self.executor, func)
+                                await self.loop.run_in_executor(self.progress_executor, func)
 
                         if len(chunk) < chunk_size or current >= total:
                             break
@@ -1094,7 +1096,7 @@ class Client(Methods):
                                 if inspect.iscoroutinefunction(progress):
                                     await func()
                                 else:
-                                    await self.loop.run_in_executor(self.executor, func)
+                                    await self.loop.run_in_executor(self.progress_executor, func)
 
                             if len(chunk) < chunk_size or current >= total:
                                 break
