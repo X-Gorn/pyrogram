@@ -309,9 +309,8 @@ class Session:
                     error_code = -Int.read(BytesIO(packet))
 
                     if error_code == 404:
-                        raise Exception(
-                            "Auth key not found in the system. You must delete your session file"
-                            "and log in again with your phone number or bot token"
+                        log.warning(
+                            "Auth key not found in the system. You must delete your session file and log in again with your phone number or bot token"
                         )
 
                     log.warning(
