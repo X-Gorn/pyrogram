@@ -140,8 +140,10 @@ class Session:
                 self.ping_task = self.loop.create_task(self.ping_worker())
 
                 log.info("Session initialized: Layer %s", layer)
-                log.info("Device: %s - %s", self.client.device_model, self.client.app_version)
-                log.info("System: %s (%s)", self.client.system_version, self.client.lang_code)
+                log.info("Device: %s - %s", self.client.device_model,
+                         self.client.app_version)
+                log.info("System: %s (%s)", self.client.system_version,
+                         self.client.lang_code)
             except AuthKeyDuplicated as e:
                 await self.stop()
                 raise e
@@ -187,15 +189,18 @@ class Session:
         await self.start()
 
     async def handle_packet(self, packet):
-        data = await self.loop.run_in_executor(
-            pyrogram.crypto_executor,
-            mtproto.unpack,
-            BytesIO(packet),
-            self.session_id,
-            self.auth_key,
-            self.auth_key_id
-        )
-
+        try:
+            data = await self.loop.run_in_executor(
+                pyrogram.crypto_executor,
+                mtproto.unpack,
+                BytesIO(packet),
+                self.session_id,
+                self.auth_key,
+                self.auth_key_id
+            )
+        except (ValueError, ConnectionError) as e:
+            log.info(e.args[0])
+            return
         messages = (
             data.body.messages
             if isinstance(data.body, MsgContainer)
@@ -217,10 +222,12 @@ class Session:
 
                 if self.stored_msg_ids:
                     if msg.msg_id < self.stored_msg_ids[0]:
-                        raise SecurityCheckMismatch("The msg_id is lower than all the stored values")
+                        raise SecurityCheckMismatch(
+                            "The msg_id is lower than all the stored values")
 
                     if msg.msg_id in self.stored_msg_ids:
-                        raise SecurityCheckMismatch("The msg_id is equal to any of the stored values")
+                        raise SecurityCheckMismatch(
+                            "The msg_id is equal to any of the stored values")
 
                     time_diff = (msg.msg_id - MsgId()) / 2 ** 32
 
@@ -258,7 +265,8 @@ class Session:
                     self.loop.create_task(self.client.handle_updates(msg.body))
 
             if msg_id in self.results:
-                self.results[msg_id].value = getattr(msg.body, "result", msg.body)
+                self.results[msg_id].value = getattr(
+                    msg.body, "result", msg.body)
                 self.results[msg_id].event.set()
 
         if len(self.pending_acks) >= self.ACKS_THRESHOLD:
@@ -307,14 +315,14 @@ class Session:
                     error_code = -Int.read(BytesIO(packet))
 
                     if error_code == 404:
-                        raise Exception(
-                            "Auth key not found in the system. You must delete your session file"
-                            "and log in again with your phone number or bot token"
+                        log.warning(
+                            "Auth key not found in the system. You must delete your session file and log in again with your phone number or bot token"
                         )
 
                     log.warning(
                         "Server sent transport error: %s (%s)",
-                        error_code, Session.TRANSPORT_ERRORS.get(error_code, "unknown error")
+                        error_code, Session.TRANSPORT_ERRORS.get(
+                            error_code, "unknown error")
                     )
 
                 if self.is_started.is_set():
@@ -369,7 +377,8 @@ class Session:
                 RPCError.raise_it(result, type(data))
 
             if isinstance(result, raw.types.BadMsgNotification):
-                log.warning("%s: %s", BadMsgNotification.__name__, BadMsgNotification(result.error_code))
+                log.warning("%s: %s", BadMsgNotification.__name__,
+                            BadMsgNotification(result.error_code))
 
             if isinstance(result, raw.types.BadServerSalt):
                 self.salt = result.new_server_salt

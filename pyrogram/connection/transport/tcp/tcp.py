@@ -157,7 +157,7 @@ class TCP:
                     self.reader.read(length - len(data)),
                     TCP.TIMEOUT
                 )
-            except (OSError, asyncio.TimeoutError):
+            except (OSError, asyncio.TimeoutError, RuntimeError, AttributeError):
                 return None
             else:
                 if chunk:
